@@ -1,9 +1,10 @@
+/*
 #include <Arduino.h>
 
 // MX1508电机驱动器引脚定义
 // 连接到电机A (Motor A)
-#define MOTOR_IN1 32    // MX1508的IN1引脚
-#define MOTOR_IN2 33    // MX1508的IN2引脚
+#define MOTOR_IN1 33    // MX1508的IN1引脚
+#define MOTOR_IN2 32    // MX1508的IN2引脚
 
 // PWM参数设置 - 用于限制启动电流
 #define PWM_FREQ 1000   // PWM频率
@@ -101,3 +102,5 @@ void loop() {
   Serial.println("一轮测试完成，等待5秒后重复...");
   delay(5000);
 }
+*/
+
