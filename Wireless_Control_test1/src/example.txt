@@ -1,0 +1,58 @@
+#include <AFMotor.h>
+AF_DCMotor MotorFR(1);   // Front right motor
+AF_DCMotor MotorFL(2);   // Front left motor
+AF_DCMotor MotorBL(3);   // Back left motor
+AF_DCMotor MotorBR(4);   // Back right motor
+const int buzPin = 2;  // Buzzer pin
+const int ledPin = A5; // LED pin
+int valSpeed = 255;    // Default motor speed
+void setup() {
+    Serial.begin(9600);
+    pinMode(buzPin, OUTPUT);
+    pinMode(ledPin, OUTPUT);
+    // Set initial motor speed
+    MotorFL.setSpeed(valSpeed);
+    MotorFR.setSpeed(valSpeed);
+    MotorBL.setSpeed(valSpeed);
+    MotorBR.setSpeed(valSpeed);
+    // Stop all motors at the beginning
+    MotorFL.run(RELEASE);
+    MotorFR.run(RELEASE);
+    MotorBL.run(RELEASE);
+    MotorBR.run(RELEASE);
+}
+void loop() {
+    while (Serial.available() > 0) {
+        char command = Serial.read(); // Read command from serial
+        Serial.println(command);
+        switch(command) {
+            case 'F':   // Move forward
+                SetSpeed(valSpeed);
+                MotorFL.run(FORWARD);
+                MotorFR.run(FORWARD);
+                MotorBL.run(FORWARD);
+                MotorBR.run(FORWARD);
+                break;
+            case 'B':   // Move backward
+                SetSpeed(valSpeed);
+                MotorFL.run(BACKWARD);
+                MotorFR.run(BACKWARD);
+                MotorBL.run(BACKWARD);
+                MotorBR.run(BACKWARD);
+                break;
+            case 'R':   // Turn right
+                SetSpeed(valSpeed);
+                MotorFL.run(FORWARD);
+                MotorFR.run(BACKWARD);
+                MotorBL.run(FORWARD);
+                MotorBR.run(BACKWARD);
+                break;
+            case 'L':   // Turn left
+                SetSpeed(valSpeed);
+                MotorFL.run(BACKWARD);
+                MotorFR.run(FORWARD);
+                MotorBL.run(BACKWARD);
+                MotorBR.run(FORWARD);
+                break;
+            case 'G':   // Forward left
+                MotorFL.setSpeed(valSpeed/4);
