@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include "BluetoothSerial.h"
+#include <ESP32Servo.h>
 
 // 电机1引脚定义 (右电机 - Right Motor)
 #define MOTOR_RIGHT_IN1 32    // 右电机的IN1引脚
@@ -13,36 +14,33 @@
 #define TRIG_PIN 27           // 超声波模块的Trig引脚
 #define ECHO_PIN 14           // 超声波模块的Echo引脚
 
-// LED和按钮引脚定义
-#define LED_PIN 22            // LED连接到GPIO22
-#define BUTTON_PIN 23         // 按钮连接到GPIO23
+// 舵机引脚定义
+#define SERVO_PIN 13          // MG996R舵机信号线连接到GPIO13
 
 // PWM参数设置
 #define PWM_FREQ 1000         // PWM频率
 #define PWM_RESOLUTION 8      // PWM分辨率，8位，0-255
 
-// PWM通道分配
-#define PWM_CHANNEL_RIGHT_1 0  // 右电机-IN1的PWM通道
-#define PWM_CHANNEL_RIGHT_2 1  // 右电机-IN2的PWM通道
-#define PWM_CHANNEL_LEFT_1 2   // 左电机-IN1的PWM通道
-#define PWM_CHANNEL_LEFT_2 3   // 左电机-IN2的PWM通道
+// PWM通道分配 - 避免与舵机库冲突
+#define PWM_CHANNEL_RIGHT_1 4  // 右电机-IN1的PWM通道（避开0-3通道）
+#define PWM_CHANNEL_RIGHT_2 5  // 右电机-IN2的PWM通道
+#define PWM_CHANNEL_LEFT_1 6   // 左电机-IN1的PWM通道
+#define PWM_CHANNEL_LEFT_2 7   // 左电机-IN2的PWM通道
 
 // 超声波参数
 #define MAX_DISTANCE 400      // 最大测距范围(cm)
 #define TIMEOUT_US 30000      // 超时时间(微秒)
 #define OBSTACLE_THRESHOLD 5  // 障碍物检测阈值(cm)
 
+// 舵机参数
+#define SERVO_CENTER 90       // 舵机中心位置
+#define SERVO_TURN_ANGLE 10   // 转向时舵机偏转角度
+
 // 创建蓝牙串口对象
 BluetoothSerial SerialBT;
 
-// 按钮防抖变量
-bool lastButtonState = HIGH;
-bool currentButtonState = HIGH;
-unsigned long lastDebounceTime = 0;
-unsigned long debounceDelay = 50;
-
-// 测试状态变量
-bool testRunning = false;
+// 创建舵机对象
+Servo servo;
 
 // 超声波检测变量
 bool obstacleDetected = false;
@@ -65,8 +63,29 @@ enum MotorState {
   RIGHT
 };
 
+// 动作阶段枚举
+enum ActionPhase {
+  PHASE_IDLE,           // 空闲状态
+  PHASE_SERVO_MOVING,   // 舵机运动阶段
+  PHASE_MOTOR_RUNNING,  // 电机运行阶段
+  PHASE_MOTOR_STOPPING, // 电机停止阶段
+  PHASE_SERVO_RETURNING // 舵机回正阶段
+};
+
 MotorState currentMotorState = STOPPED;
 MotorState targetMotorState = STOPPED;
+
+// 舵机控制变量
+int currentServoAngle = SERVO_CENTER;    // 当前舵机角度
+int targetServoAngle = SERVO_CENTER;     // 目标舵机角度
+bool servoNeedsUpdate = false;           // 舵机是否需要更新
+
+// 动作阶段控制变量
+ActionPhase currentPhase = PHASE_IDLE;
+MotorState pendingMotorState = STOPPED;  // 等待执行的电机状态
+unsigned long phaseStartTime = 0;        // 阶段开始时间
+unsigned long servoMoveDelay = 500;      // 舵机运动等待时间(ms)
+unsigned long motorStopDelay = 300;      // 电机停止等待时间(ms)
 
 // 函数声明
 void motorsStop();
@@ -74,13 +93,15 @@ void motorsForward();
 void motorsBackward();
 void motorsLeft();
 void motorsRight();
-void runMotorTest();
-bool readButtonWithDebounce();
 void processBluetoothCommand();
 void updateMotorSpeed();
 void setMotorDirection(MotorState direction);
 float measureDistance();
 void checkObstacle();
+void updateServoPosition();
+void updateActionPhase();
+void startTurnSequence(MotorState turnDirection);
+void startStopSequence();
 
 void setup() {
   // 初始化串口监视器
@@ -93,18 +114,12 @@ void setup() {
   Serial.println("F = 前进, B = 后退, L = 左转, R = 右转, S = 停止");
   Serial.print("最大电机速度设置为: ");
   Serial.print(maxMotorSpeed);
-  Serial.println(" (70% 功率)");
-  Serial.println("障碍物检测已启用，阈值: 5cm");
-  
-  // 配置按钮和LED引脚
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(LED_PIN, OUTPUT);
-  
-  // 配置超声波引脚
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
+  Serial.println(" (70% 功率)");  Serial.println("障碍物检测已启用，阈值: 5cm");
+    // 配置超声波引脚
+  pinMode(TRIG_PIN, OUTPUT);  pinMode(ECHO_PIN, INPUT);
   digitalWrite(TRIG_PIN, LOW);
-  digitalWrite(LED_PIN, LOW);
+  
+  Serial.println("开始配置PWM通道和电机引脚...");
   
   // 配置所有PWM通道
   ledcSetup(PWM_CHANNEL_RIGHT_1, PWM_FREQ, PWM_RESOLUTION);
@@ -117,6 +132,23 @@ void setup() {
   ledcAttachPin(MOTOR_RIGHT_IN2, PWM_CHANNEL_RIGHT_2);
   ledcAttachPin(MOTOR_LEFT_IN1, PWM_CHANNEL_LEFT_1);
   ledcAttachPin(MOTOR_LEFT_IN2, PWM_CHANNEL_LEFT_2);
+  
+  // 立即将所有PWM输出设置为0，确保电机不会意外启动
+  ledcWrite(PWM_CHANNEL_RIGHT_1, 0);
+  ledcWrite(PWM_CHANNEL_RIGHT_2, 0);
+  ledcWrite(PWM_CHANNEL_LEFT_1, 0);
+  ledcWrite(PWM_CHANNEL_LEFT_2, 0);
+  
+  Serial.println("所有电机PWM通道已初始化为0");
+  delay(100);  // 短暂延时确保设置生效
+  
+  // 初始化舵机（在电机PWM设置之后）
+  Serial.println("正在初始化舵机...");
+  servo.attach(SERVO_PIN);
+  delay(100);  // 等待舵机库初始化
+  servo.write(SERVO_CENTER);  // 舵机初始化到中心位置
+  Serial.println("舵机已初始化到中心位置(90度)");
+  delay(500);  // 等待舵机到位
   
   // 初始状态：所有电机停止
   motorsStop();
@@ -158,11 +190,9 @@ void checkObstacle() {
     lastDistanceCheck = currentTime;
     
     float distance = measureDistance();
-    
-    if (distance > 0 && distance <= OBSTACLE_THRESHOLD) {
+      if (distance > 0 && distance <= OBSTACLE_THRESHOLD) {
       if (!obstacleDetected) {
         obstacleDetected = true;
-        digitalWrite(LED_PIN, HIGH);
         Serial.print("检测到障碍物！距离: ");
         Serial.print(distance, 1);
         Serial.println(" cm");
@@ -174,11 +204,9 @@ void checkObstacle() {
           Serial.println("因检测到障碍物，电机已停止");
           SerialBT.println("Motors stopped due to obstacle");
         }
-      }
-    } else if (distance > OBSTACLE_THRESHOLD || distance == -1) {
+      }    } else if (distance > OBSTACLE_THRESHOLD || distance == -1) {
       if (obstacleDetected) {
         obstacleDetected = false;
-        digitalWrite(LED_PIN, LOW);
         if (distance > 0) {
           Serial.print("障碍物已移除，距离: ");
           Serial.print(distance, 1);
@@ -208,16 +236,15 @@ void setMotorDirection(MotorState direction) {
       // 左电机反转方向
       ledcWrite(PWM_CHANNEL_LEFT_1, 0);
       break;
-      
     case LEFT:
-      // 右电机正转，左电机反转
+      // 左转：两个电机都前进，但左电机会比右电机慢
       ledcWrite(PWM_CHANNEL_RIGHT_2, 0);
-      ledcWrite(PWM_CHANNEL_LEFT_1, 0);
+      ledcWrite(PWM_CHANNEL_LEFT_2, 0);
       break;
       
     case RIGHT:
-      // 右电机反转，左电机正转
-      ledcWrite(PWM_CHANNEL_RIGHT_1, 0);
+      // 右转：两个电机都前进，但右电机会比左电机慢
+      ledcWrite(PWM_CHANNEL_RIGHT_2, 0);
       ledcWrite(PWM_CHANNEL_LEFT_2, 0);
       break;
       
@@ -236,54 +263,38 @@ void updateMotorSpeed() {
   static unsigned long lastSpeedUpdate = 0;
   
   if (millis() - lastSpeedUpdate < speedDelay) {
-    return; // 还没到更新时间
+    return;
   }
   
   lastSpeedUpdate = millis();
   
+  // 只在空闲状态或电机运行阶段才更新电机
+  if (currentPhase != PHASE_IDLE && currentPhase != PHASE_MOTOR_RUNNING && currentPhase != PHASE_MOTOR_STOPPING) {
+    return;
+  }
+  
   if (targetMotorState == STOPPED) {
-    // 软停止：逐渐减速
     if (currentSpeed > 0) {
-      currentSpeed -= speedStep * 2; // 停止时减速更快
+      currentSpeed -= speedStep * 2;
       if (currentSpeed < 0) currentSpeed = 0;
       
       if (currentSpeed == 0) {
         currentMotorState = STOPPED;
         setMotorDirection(STOPPED);
-        Serial.println("电机已停止");
-        SerialBT.println("Motors STOPPED");
       }
     }
   } else {
-    // 软启动：逐渐加速
     if (currentMotorState != targetMotorState) {
-      // 改变方向时先停止
-      if (currentSpeed > 0) {
-        currentSpeed -= speedStep * 2;
-        if (currentSpeed <= 0) {
-          currentSpeed = 0;
-          currentMotorState = targetMotorState;
-          setMotorDirection(targetMotorState);
-        }
-      } else {
-        currentMotorState = targetMotorState;
-        setMotorDirection(targetMotorState);
-      }
-    } else {
-      // 相同方向，逐渐加速
-      if (currentSpeed < maxMotorSpeed) {
-        if (currentSpeed == 0) {
-          currentSpeed = minSpeed; // 从最小速度开始
-        } else {
-          currentSpeed += speedStep;
-        }
-        if (currentSpeed > maxMotorSpeed) {
-          currentSpeed = maxMotorSpeed;
-        }
+      currentSpeed = minSpeed;
+      currentMotorState = targetMotorState;
+      setMotorDirection(currentMotorState);
+    } else if (currentSpeed < maxMotorSpeed) {
+      currentSpeed += speedStep;
+      if (currentSpeed > maxMotorSpeed) {
+        currentSpeed = maxMotorSpeed;
       }
     }
   }
-  
   // 应用当前速度
   if (currentSpeed > 0 && currentMotorState != STOPPED) {
     switch(currentMotorState) {
@@ -298,23 +309,137 @@ void updateMotorSpeed() {
         break;
         
       case LEFT:
+        // 左转：右电机全速，左电机减速
         ledcWrite(PWM_CHANNEL_RIGHT_1, currentSpeed);
-        ledcWrite(PWM_CHANNEL_LEFT_2, currentSpeed);
+        ledcWrite(PWM_CHANNEL_LEFT_1, currentSpeed * 0.6);  // 左电机60%速度
         break;
         
       case RIGHT:
-        ledcWrite(PWM_CHANNEL_RIGHT_2, currentSpeed);
+        // 右转：左电机全速，右电机减速
+        ledcWrite(PWM_CHANNEL_RIGHT_1, currentSpeed * 0.6);  // 右电机60%速度
         ledcWrite(PWM_CHANNEL_LEFT_1, currentSpeed);
         break;
     }
   }
 }
 
+// 更新舵机位置
+void updateServoPosition() {
+  if (servoNeedsUpdate) {
+    Serial.print("舵机开始转动：从 ");
+    Serial.print(currentServoAngle);
+    Serial.print("度 到 ");
+    Serial.print(targetServoAngle);
+    Serial.println("度");
+    
+    currentServoAngle = targetServoAngle;
+    servo.write(currentServoAngle);
+    servoNeedsUpdate = false;
+    
+    Serial.print("舵机转动完成，当前角度: ");
+    Serial.print(currentServoAngle);
+    Serial.println("度");
+    
+    // 检查舵机是否正常响应
+    if (currentServoAngle == SERVO_CENTER) {
+      Serial.println("舵机回中完成");
+    } else {
+      Serial.println("舵机转向完成");
+    }
+  }
+}
+
+// 开始转向序列：舵机先动，然后电机
+void startTurnSequence(MotorState turnDirection) {
+  if (currentPhase != PHASE_IDLE) {
+    Serial.println("动作进行中，忽略新命令");
+    return;
+  }
+  
+  pendingMotorState = turnDirection;
+  currentPhase = PHASE_SERVO_MOVING;
+  phaseStartTime = millis();
+  
+  // 设置舵机目标角度
+  if (turnDirection == LEFT) {
+    targetServoAngle = SERVO_CENTER + SERVO_TURN_ANGLE;
+    Serial.println("开始左转序列：舵机先转动");
+    SerialBT.println("Starting LEFT turn: Servo moving first");
+  } else if (turnDirection == RIGHT) {
+    targetServoAngle = SERVO_CENTER - SERVO_TURN_ANGLE;
+    Serial.println("开始右转序列：舵机先转动");
+    SerialBT.println("Starting RIGHT turn: Servo moving first");
+  }
+  servoNeedsUpdate = true;
+}
+
+// 开始停止序列：电机先停，然后舵机回正
+void startStopSequence() {
+  if (currentPhase == PHASE_MOTOR_RUNNING) {
+    currentPhase = PHASE_MOTOR_STOPPING;
+    phaseStartTime = millis();
+    targetMotorState = STOPPED;
+    Serial.println("开始停止序列：电机先停止");
+    SerialBT.println("Starting stop sequence: Motors stopping first");
+  }
+}
+
+// 更新动作阶段
+void updateActionPhase() {
+  unsigned long currentTime = millis();
+  
+  switch (currentPhase) {
+    case PHASE_SERVO_MOVING:
+      // 等待舵机转动完成
+      if (currentTime - phaseStartTime >= servoMoveDelay) {
+        currentPhase = PHASE_MOTOR_RUNNING;
+        targetMotorState = pendingMotorState;
+        Serial.println("舵机转动完成，启动电机");
+        SerialBT.println("Servo positioned, starting motors");
+      }
+      break;
+      
+    case PHASE_MOTOR_STOPPING:
+      // 等待电机停止完成
+      if (currentMotorState == STOPPED && currentTime - phaseStartTime >= motorStopDelay) {
+        currentPhase = PHASE_SERVO_RETURNING;
+        phaseStartTime = currentTime;
+        targetServoAngle = SERVO_CENTER;
+        servoNeedsUpdate = true;
+        Serial.println("电机停止完成，舵机回正");
+        SerialBT.println("Motors stopped, servo returning to center");
+      }
+      break;
+      
+    case PHASE_SERVO_RETURNING:
+      // 等待舵机回正完成
+      if (currentTime - phaseStartTime >= servoMoveDelay) {
+        currentPhase = PHASE_IDLE;
+        Serial.println("停止序列完成");
+        SerialBT.println("Stop sequence completed");
+      }
+      break;
+      
+    case PHASE_MOTOR_RUNNING:
+    case PHASE_IDLE:
+    default:
+      // 这些状态不需要自动转换
+      break;
+  }
+}
+
 // 双电机停止函数
 void motorsStop() {
-  targetMotorState = STOPPED;
-  Serial.println("正在停止电机...");
-  SerialBT.println("Stopping motors...");
+  if (currentPhase == PHASE_MOTOR_RUNNING && (currentMotorState == LEFT || currentMotorState == RIGHT)) {
+    // 如果当前是转向状态，启动停止序列
+    startStopSequence();
+  } else {
+    // 直接停止
+    targetMotorState = STOPPED;
+    currentPhase = PHASE_IDLE;
+    Serial.println("正在停止电机...");
+    SerialBT.println("Stopping motors...");
+  }
 }
 
 // 双电机前进函数 - 添加障碍物检测
@@ -343,9 +468,7 @@ void motorsLeft() {
     SerialBT.println("Obstacle detected, LEFT command blocked");
     return;
   }
-  targetMotorState = LEFT;
-  Serial.println("左转");
-  SerialBT.println("Turn LEFT");
+  startTurnSequence(LEFT);
 }
 
 // 右转函数 - 添加障碍物检测
@@ -355,144 +478,7 @@ void motorsRight() {
     SerialBT.println("Obstacle detected, RIGHT command blocked");
     return;
   }
-  targetMotorState = RIGHT;
-  Serial.println("右转");
-  SerialBT.println("Turn RIGHT");
-}
-
-// 按钮防抖读取函数
-bool readButtonWithDebounce() {
-  int reading = digitalRead(BUTTON_PIN);
-  
-  if (reading != lastButtonState) {
-    lastDebounceTime = millis();
-  }
-  
-  if ((millis() - lastDebounceTime) > debounceDelay) {
-    if (reading != currentButtonState) {
-      currentButtonState = reading;
-      if (currentButtonState == LOW) {
-        lastButtonState = reading;
-        return true;
-      }
-    }
-  }
-  
-  lastButtonState = reading;
-  return false;
-}
-
-// 非阻塞电机测试相关变量
-unsigned long testStepStartTime = 0;
-int testStep = 0;
-bool testStepInProgress = false;
-
-// 修改电机测试函数为非阻塞版本
-void runMotorTest() {
-  if (!testRunning) {
-    // 开始测试
-    Serial.println("开始电机测试...");
-    SerialBT.println("Starting motor test...");
-    testRunning = true;
-    testStep = 1;
-    testStepStartTime = millis();
-    testStepInProgress = false;
-  }
-}
-
-// 添加非阻塞测试更新函数
-void updateMotorTest() {
-  if (!testRunning) return;
-  
-  unsigned long currentTime = millis();
-  
-  switch(testStep) {
-    case 1: // 测试1：前进
-      if (!testStepInProgress) {
-        Serial.println("测试1：前进");
-        motorsForward();
-        testStepInProgress = true;
-        testStepStartTime = currentTime;
-      } else if (currentTime - testStepStartTime >= 3000) {
-        motorsStop();
-        testStepInProgress = false;
-        testStepStartTime = currentTime;
-        testStep = 2; // 进入停止等待
-      }
-      break;
-      
-    case 2: // 停止等待1
-      if (currentTime - testStepStartTime >= 2000) {
-        testStep = 3;
-        testStepInProgress = false;
-      }
-      break;
-      
-    case 3: // 测试2：后退
-      if (!testStepInProgress) {
-        Serial.println("测试2：后退");
-        motorsBackward();
-        testStepInProgress = true;
-        testStepStartTime = currentTime;
-      } else if (currentTime - testStepStartTime >= 3000) {
-        motorsStop();
-        testStepInProgress = false;
-        testStepStartTime = currentTime;
-        testStep = 4;
-      }
-      break;
-      
-    case 4: // 停止等待2
-      if (currentTime - testStepStartTime >= 2000) {
-        testStep = 5;
-        testStepInProgress = false;
-      }
-      break;
-      
-    case 5: // 测试3：左转
-      if (!testStepInProgress) {
-        Serial.println("测试3：左转");
-        motorsLeft();
-        testStepInProgress = true;
-        testStepStartTime = currentTime;
-      } else if (currentTime - testStepStartTime >= 3000) {
-        motorsStop();
-        testStepInProgress = false;
-        testStepStartTime = currentTime;
-        testStep = 6;
-      }
-      break;
-      
-    case 6: // 停止等待3
-      if (currentTime - testStepStartTime >= 2000) {
-        testStep = 7;
-        testStepInProgress = false;
-      }
-      break;
-      
-    case 7: // 测试4：右转
-      if (!testStepInProgress) {
-        Serial.println("测试4：右转");
-        motorsRight();
-        testStepInProgress = true;
-        testStepStartTime = currentTime;
-      } else if (currentTime - testStepStartTime >= 3000) {
-        motorsStop();
-        testStepInProgress = false;
-        testStepStartTime = currentTime;
-        testStep = 8;
-      }
-      break;
-      
-    case 8: // 最终停止等待
-      if (currentTime - testStepStartTime >= 2000) {
-        Serial.println("电机测试完成！");
-        SerialBT.println("Motor test completed!");
-        testRunning = false;
-        testStep = 0;
-      }
-      break;
-  }
+  startTurnSequence(RIGHT);
 }
 
 // 修改处理蓝牙命令函数 - 保持原有逻辑
@@ -504,22 +490,9 @@ void processBluetoothCommand() {
     Serial.print(" (ASCII: ");
     Serial.print((int)command);
     Serial.println(")");
-    
-    // 紧急停止：即使在测试中也允许停止
+      // 紧急停止
     if (command == 'S' || command == 's') {
       motorsStop();
-      if (testRunning) {
-        testRunning = false;
-        testStep = 0;
-        Serial.println("测试被中止");
-        SerialBT.println("Test aborted");
-      }
-      return;
-    }
-    
-    // 如果正在测试中，除停止外忽略其他蓝牙命令
-    if (testRunning) {
-      SerialBT.println("Test running, only STOP (S) command accepted");
       return;
     }
     
@@ -579,16 +552,14 @@ void loop() {
   // 处理蓝牙命令
   processBluetoothCommand();
   
+  // 更新动作阶段控制
+  updateActionPhase();
+  
   // 更新电机速度（软启动/软停止）
   updateMotorSpeed();
   
-  // 更新非阻塞测试
-  updateMotorTest();
-  
-  // 检测按钮按下（硬件测试）
-  if (readButtonWithDebounce() && !testRunning) {
-    runMotorTest();
-  }
+  // 更新舵机位置
+  updateServoPosition();
   
   delay(10);
 }
