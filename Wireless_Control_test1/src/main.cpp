@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include "BluetoothSerial.h"
-#include <ESP32Servo.h>
+// 移除ESP32Servo库，使用手动PWM控制
 
 // 电机1引脚定义 (右电机 - Right Motor)
 #define MOTOR_RIGHT_IN1 32    // 右电机的IN1引脚
@@ -18,8 +18,13 @@
 #define SERVO_PIN 13          // MG996R舵机信号线连接到GPIO13
 
 // PWM参数设置
-#define PWM_FREQ 1000         // PWM频率
-#define PWM_RESOLUTION 8      // PWM分辨率，8位，0-255
+#define PWM_FREQ 1000         // 电机PWM频率
+#define PWM_RESOLUTION 8      // 电机PWM分辨率，8位，0-255
+
+// 舵机PWM参数
+#define SERVO_PWM_FREQ 50     // 舵机PWM频率 50Hz
+#define SERVO_PWM_RESOLUTION 16 // 舵机PWM分辨率 16位，0-65535
+#define SERVO_PWM_CHANNEL 8   // 舵机PWM通道（避开电机通道4-7）
 
 // PWM通道分配 - 避免与舵机库冲突
 #define PWM_CHANNEL_RIGHT_1 4  // 右电机-IN1的PWM通道（避开0-3通道）
@@ -33,14 +38,18 @@
 #define OBSTACLE_THRESHOLD 5  // 障碍物检测阈值(cm)
 
 // 舵机参数
-#define SERVO_CENTER 90       // 舵机中心位置
+#define SERVO_CENTER 92       // 舵机中心位置（往右补偿2度）
 #define SERVO_TURN_ANGLE 10   // 转向时舵机偏转角度
+#define SERVO_MIN_ANGLE 10    // 舵机最小角度限制
+#define SERVO_MAX_ANGLE 170   // 舵机最大角度限制
 
 // 创建蓝牙串口对象
 BluetoothSerial SerialBT;
 
-// 创建舵机对象
-Servo servo;
+// 舵机控制变量（手动PWM）- MG996R专用脉宽范围
+int servoMinPulse = 1638;   // 0.5ms对应的PWM值 (0.5ms/20ms * 65536 ≈ 1638)
+int servoMaxPulse = 8192;   // 2.5ms对应的PWM值 (2.5ms/20ms * 65536 ≈ 8192)
+int servoCenterPulse = 4915; // 1.5ms对应的PWM值 (1.5ms/20ms * 65536 ≈ 4915)
 
 // 超声波检测变量
 bool obstacleDetected = false;
@@ -102,6 +111,7 @@ void updateServoPosition();
 void updateActionPhase();
 void startTurnSequence(MotorState turnDirection);
 void startStopSequence();
+void servoWriteAngle(int angle);  // 手动舵机控制函数
 
 void setup() {
   // 初始化串口监视器
@@ -139,16 +149,38 @@ void setup() {
   ledcWrite(PWM_CHANNEL_LEFT_1, 0);
   ledcWrite(PWM_CHANNEL_LEFT_2, 0);
   
-  Serial.println("所有电机PWM通道已初始化为0");
-  delay(100);  // 短暂延时确保设置生效
+  Serial.println("所有电机PWM通道已初始化为0");  delay(100);  // 短暂延时确保设置生效
   
-  // 初始化舵机（在电机PWM设置之后）
-  Serial.println("正在初始化舵机...");
-  servo.attach(SERVO_PIN);
-  delay(100);  // 等待舵机库初始化
-  servo.write(SERVO_CENTER);  // 舵机初始化到中心位置
-  Serial.println("舵机已初始化到中心位置(90度)");
-  delay(500);  // 等待舵机到位
+  // 初始化舵机PWM（在电机PWM设置之后）
+  Serial.println("正在初始化舵机PWM...");
+  ledcSetup(SERVO_PWM_CHANNEL, SERVO_PWM_FREQ, SERVO_PWM_RESOLUTION);
+  ledcAttachPin(SERVO_PIN, SERVO_PWM_CHANNEL);
+  delay(100);  // 等待PWM初始化
+    // 舵机初始化测试序列
+  Serial.println("舵机强制重置序列：");
+  
+  Serial.println("步骤1: 设置为0度");
+  servoWriteAngle(0);
+  delay(1000);
+  
+  Serial.println("步骤2: 设置为180度");
+  servoWriteAngle(180);
+  delay(1000);
+  
+  Serial.println("步骤3: 设置为90度");
+  servoWriteAngle(90);
+  delay(1000);
+  
+  Serial.println("步骤4: 设置为中心位置");
+  servoWriteAngle(SERVO_CENTER);  // 舵机初始化到中心位置
+  Serial.print("舵机已初始化到中心位置(");
+  Serial.print(SERVO_CENTER);
+  Serial.print("度，角度范围: ");
+  Serial.print(SERVO_MIN_ANGLE);
+  Serial.print("-");
+  Serial.print(SERVO_MAX_ANGLE);
+  Serial.println("度)");
+  delay(1000);  // 等待舵机到位
   
   // 初始状态：所有电机停止
   motorsStop();
@@ -331,9 +363,8 @@ void updateServoPosition() {
     Serial.print("度 到 ");
     Serial.print(targetServoAngle);
     Serial.println("度");
-    
-    currentServoAngle = targetServoAngle;
-    servo.write(currentServoAngle);
+      currentServoAngle = targetServoAngle;
+    servoWriteAngle(currentServoAngle);
     servoNeedsUpdate = false;
     
     Serial.print("舵机转动完成，当前角度: ");
@@ -543,6 +574,28 @@ void processBluetoothCommand() {
         break;
     }
   }
+}
+
+// 手动舵机控制函数：将角度(10-170)转换为PWM值
+void servoWriteAngle(int angle) {
+  // 限制角度范围到安全区间
+  if (angle < SERVO_MIN_ANGLE) angle = SERVO_MIN_ANGLE;
+  if (angle > SERVO_MAX_ANGLE) angle = SERVO_MAX_ANGLE;
+  
+  // 将角度(0-180)映射到PWM值(servoMinPulse-servoMaxPulse)
+  int pwmValue = map(angle, 0, 180, servoMinPulse, servoMaxPulse);
+  
+  // 输出PWM信号
+  ledcWrite(SERVO_PWM_CHANNEL, pwmValue);
+    Serial.print("舵机设置角度: ");
+  Serial.print(angle);
+  Serial.print("度 (限制范围: ");
+  Serial.print(SERVO_MIN_ANGLE);
+  Serial.print("-");
+  Serial.print(SERVO_MAX_ANGLE);
+  Serial.print("度), PWM值: ");
+  Serial.print(pwmValue);
+  Serial.println(" (脉宽范围: 0.5ms-2.5ms)");
 }
 
 void loop() {
